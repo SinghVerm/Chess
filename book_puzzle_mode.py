@@ -14,8 +14,7 @@ import chess.engine
 import streamlit as st
 
 BASE = Path(__file__).resolve().parent / "book_puzzles"
-PUZZLES_FILE = BASE / "puzzles.json"
-PUZZLES = json.loads(PUZZLES_FILE.read_text(encoding="utf-8")) if PUZZLES_FILE.is_file() else []
+PUZZLES = json.loads((BASE / "puzzles.json").read_text(encoding="utf-8"))
 BY_ID = {p["number"]: p for p in PUZZLES}
 PROGRESS_FILE = BASE / "progress.json"
 
@@ -107,6 +106,8 @@ def start(number):
     s.book_puzzle_parse_error = error
     s.book_puzzle_last_nonce = None
     s.book_puzzle_last_info = ""
+    s.book_puzzle_branch = "guided"  # Wrong moves branch into a game against Stockfish.
+    s.book_puzzle_engine_pending = False
 
 
 def _score_side(info, board):
@@ -150,15 +151,96 @@ def _mark_complete():
     s.book_puzzle_notice = "Correct. Puzzle completed."
 
 
-def play_move(move, engine_path):
+def strongest_stockfish_move(board, engine_path, think_seconds):
+    """Play the top engine move without Elo/skill weakening or randomisation.
+
+    Thinking time controls search depth in practice; it is not a strength cap.
+    This is independent of the adjustable-rating opponent in the main app.
+    """
+    if not engine_path:
+        raise FileNotFoundError("Stockfish is not configured.")
+    if board.is_game_over():
+        return None
+    with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
+        options = {}
+        if "UCI_LimitStrength" in engine.options:
+            options["UCI_LimitStrength"] = False
+        if "Skill Level" in engine.options:
+            options["Skill Level"] = 20
+        if "Threads" in engine.options:
+            options["Threads"] = min(4, max(1, (os.cpu_count() or 2) - 1))
+        if "Hash" in engine.options:
+            options["Hash"] = 128
+        if options:
+            engine.configure(options)
+        result = engine.play(board, chess.engine.Limit(time=float(think_seconds)))
+        if result.move not in board.legal_moves:
+            raise RuntimeError("The engine did not return a legal move.")
+        return result.move
+
+
+def _push_puzzle_move(board, move):
+    st.session_state.book_puzzle_history.append(move.uci())
+    board.push(move)
+    st.session_state.book_puzzle_board_fen = board.fen()
+
+
+def play_stockfish_reply(engine_path, think_seconds):
+    """Finish an outstanding engine turn; keep the position on engine errors."""
+    s = st.session_state
+    board = chess.Board(s.book_puzzle_board_fen)
+    p = BY_ID[s.book_puzzle_number]
+    if board.is_game_over():
+        s.book_puzzle_engine_pending = False
+        s.book_puzzle_status = "finished"
+        s.book_puzzle_notice += " The line has ended. Press Retry to solve the puzzle again."
+        return
+    if board.turn == (p["side"] == "white"):
+        s.book_puzzle_engine_pending = False
+        return
+    s.book_puzzle_engine_pending = True
+    try:
+        reply = strongest_stockfish_move(board, engine_path, think_seconds)
+    except (OSError, ValueError, RuntimeError, chess.engine.EngineError, chess.engine.EngineTerminatedError) as exc:
+        s.book_puzzle_notice += f" Stockfish could not reply ({exc}). Check the engine path, then use 'Play Stockfish reply' or Retry."
+        return
+    if reply is None:
+        s.book_puzzle_engine_pending = False
+        s.book_puzzle_status = "finished"
+        return
+    reply_label = board.san(reply)
+    _push_puzzle_move(board, reply)
+    s.book_puzzle_engine_pending = False
+    s.book_puzzle_notice += f" Stockfish's best reply: {reply_label}."
+    if board.is_game_over():
+        s.book_puzzle_status = "finished"
+        s.book_puzzle_notice += " Game over — Retry to return to the puzzle."
+    else:
+        s.book_puzzle_notice += " Your turn — keep playing, or Retry the puzzle."
+
+
+def play_move(move, engine_path, think_seconds=3):
     s = st.session_state
     if s.book_puzzle_status != "playing":
         return
     board = chess.Board(s.book_puzzle_board_fen)
     p = BY_ID[s.book_puzzle_number]
-    if board.turn != (p["side"] == "white") or move not in board.legal_moves:
-        s.book_puzzle_notice = "Illegal move — try another square."
+    if board.turn != (p["side"] == "white"):
+        s.book_puzzle_notice = "Waiting for Stockfish. Use 'Play Stockfish reply' if needed."
         return
+    if move not in board.legal_moves:
+        s.book_puzzle_notice = "Illegal move — choose a legal square."
+        return
+
+    label = board.san(move)
+    # After the first off-solution move, keep ALL subsequent legal moves.
+    # Stockfish responds at full strength to each human move.
+    if s.book_puzzle_branch == "stockfish":
+        _push_puzzle_move(board, move)
+        s.book_puzzle_notice = f"You played {label}."
+        play_stockfish_reply(engine_path, think_seconds)
+        return
+
     plan = s.book_puzzle_plan
     expected = chess.Move.from_uci(plan[s.book_puzzle_cursor]) if s.book_puzzle_cursor < len(plan) else None
     approved = expected == move
@@ -167,14 +249,16 @@ def play_move(move, engine_path):
     if not approved:
         alternate, explanation = engine_alternative(board, move, engine_path)
         approved = alternate
+
     if not approved:
         s.book_puzzle_wrong += 1
-        s.book_puzzle_notice = "Not the intended solution. Look for a weakness, then checks, captures and threats. Try again."
+        s.book_puzzle_branch = "stockfish"
+        _push_puzzle_move(board, move)
+        s.book_puzzle_notice = f"{label} is legal, but it does not match the book's intended solution."
+        play_stockfish_reply(engine_path, think_seconds)
         return
-    label = board.san(move)
-    board.push(move)
-    s.book_puzzle_history.append(move.uci())
-    s.book_puzzle_board_fen = board.fen()
+
+    _push_puzzle_move(board, move)
     s.book_puzzle_notice = f"Correct — {label}." + (" " + explanation if explanation else "")
     s.book_puzzle_last_info = explanation
     if alternate:
@@ -183,30 +267,43 @@ def play_move(move, engine_path):
         return
 
     s.book_puzzle_cursor += 1
-    # Advance through a verified book line, including its forced opponent replies.
+    # Keep the book's verified opponent continuation for correct solutions.
     if s.book_puzzle_cursor < len(plan):
         reply = chess.Move.from_uci(plan[s.book_puzzle_cursor])
         if reply in board.legal_moves and board.turn != (p["side"] == "white"):
-            reply_san = board.san(reply)
-            board.push(reply)
-            s.book_puzzle_history.append(reply.uci())
-            s.book_puzzle_board_fen = board.fen()
+            reply_label = board.san(reply)
+            _push_puzzle_move(board, reply)
             s.book_puzzle_cursor += 1
-            s.book_puzzle_notice += f" Opponent responds {reply_san}. Find the next move."
-    # Book solution is exhausted or doesn't have a verified continuation.
+            s.book_puzzle_notice += f" Book reply: {reply_label}. Find the next move."
     if s.book_puzzle_cursor >= len(plan) or board.is_game_over():
         _mark_complete()
 
 
+def puzzle_move_history(puzzle, history):
+    """Show the actual explored line in human-readable chess notation."""
+    board = chess.Board(puzzle["fen"])
+    labels = []
+    for uci in history:
+        move = chess.Move.from_uci(uci)
+        if move not in board.legal_moves:
+            break
+        prefix = f"{board.fullmove_number}." if board.turn == chess.WHITE else f"{board.fullmove_number}..."
+        labels.append(f"{prefix} {board.san(move)}")
+        board.push(move)
+    return "  ".join(labels)
+
+
 def render_book_puzzle_mode(engine_path, board_component, piece_images, board_position_dict, legal_move_map):
-    if not PUZZLES:
-        st.error("Book puzzles are missing from the GitHub deployment. Commit book_puzzles/puzzles.json and all 100 PNG files beside app.py, then redeploy.")
-        st.stop()
     s = st.session_state
     if "book_puzzle_progress" not in s:
         s.book_puzzle_progress = read_progress()
     if "book_puzzle_number" not in s:
         start(1)
+    # Provide defaults if code is reloaded while an older session is still open.
+    if "book_puzzle_branch" not in s:
+        s.book_puzzle_branch = "guided"
+    if "book_puzzle_engine_pending" not in s:
+        s.book_puzzle_engine_pending = False
     n = s.book_puzzle_number
     st.sidebar.divider()
     st.sidebar.subheader("Book practice")
@@ -221,6 +318,12 @@ def render_book_puzzle_mode(engine_path, board_component, piece_images, board_po
     solved = sum(1 for v in s.book_puzzle_progress.values() if v.get("solved", 0) > 0)
     st.sidebar.progress(solved / 100, text=f"{solved}/100 puzzles solved")
     st.sidebar.caption("Progress is saved locally to book_puzzles/progress.json.")
+    think_seconds = st.sidebar.slider(
+        "Stockfish thinking time (seconds)",
+        min_value=1, max_value=20, value=3,
+        help="Full strength (Skill 20, no Elo cap). More seconds = deeper calculation.",
+        key="book_puzzle_think_seconds",
+    )
 
     puzzle = BY_ID[n]
     board = chess.Board(s.book_puzzle_board_fen)
@@ -231,9 +334,11 @@ def render_book_puzzle_mode(engine_path, board_component, piece_images, board_po
         st.subheader(f"Puzzle {n} of 100 · {puzzle['tier']}")
         st.caption(f"{puzzle['side'].title()} to move · PDF page {puzzle['page']}")
     with bar_right:
-        st.metric("Incorrect attempts", s.book_puzzle_wrong)
+        st.metric("Moves off the book line", s.book_puzzle_wrong)
     if not engine_path:
-        st.info("Stockfish was not found. The book's verified moves still work, but engine-approved alternatives are unavailable. Set its path in the sidebar.")
+        st.info("Stockfish was not found. Correct book moves still work, but wrong-move replies require the Stockfish executable. Set its path in the sidebar.")
+    if s.book_puzzle_branch == "stockfish":
+        st.info("**Play against Stockfish:** You left the book's solution. Every legal move now stays on the board, and Stockfish plays its strongest reply. Press Retry to restart the original puzzle.")
     if s.book_puzzle_parse_error:
         st.warning(s.book_puzzle_parse_error)
     if s.book_puzzle_notice:
@@ -279,8 +384,16 @@ def render_book_puzzle_mode(engine_path, board_component, piece_images, board_po
                     a=chess.parse_square(from_sq);b=chess.parse_square(to_sq)
                     piece=board.piece_at(a)
                     promo = chess.QUEEN if piece and piece.piece_type==chess.PAWN and chess.square_rank(b) in (0,7) else None
-                    play_move(chess.Move(a,b,promotion=promo),engine_path)
+                    play_move(chess.Move(a,b,promotion=promo),engine_path,think_seconds)
                     st.rerun()
+        if s.book_puzzle_engine_pending:
+            if st.button("Play Stockfish reply", use_container_width=True, type="primary"):
+                s.book_puzzle_notice = "Retrying Stockfish's best move."
+                play_stockfish_reply(engine_path, think_seconds)
+                st.rerun()
+        if s.book_puzzle_history:
+            with st.expander("Moves played in this position"):
+                st.write(puzzle_move_history(puzzle, s.book_puzzle_history))
         prev_col,next_col,restart_col=st.columns(3)
         with prev_col:
             if st.button("Previous",use_container_width=True,disabled=n<=1):
@@ -331,4 +444,4 @@ def render_book_puzzle_mode(engine_path, board_component, piece_images, board_po
             st.image(str(BASE/f"{n:03d}.png"),use_container_width=True)
             st.caption("Diagram extracted from your uploaded PDF; White or Black is shown at the bottom as in the source.")
         with st.expander("How moves are graded"):
-            st.write("Moves from the verified book solution are accepted. Stockfish can also approve a different move when its evaluation is very close to the best continuation. Wrong attempts leave the board unchanged so you can try again. The book's source mistakes are noted where detected.")
+            st.write("Book-solution moves are marked correct and follow the printed line. Stockfish may also accept a strong alternative. Any other legal move is played on the board; Stockfish responds at full strength, and you can keep playing. Off-solution exploration does not count as solving the puzzle. Press Retry to return to the book position.")
