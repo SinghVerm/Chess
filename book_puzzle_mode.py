@@ -14,7 +14,8 @@ import chess.engine
 import streamlit as st
 
 BASE = Path(__file__).resolve().parent / "book_puzzles"
-PUZZLES = json.loads((BASE / "puzzles.json").read_text(encoding="utf-8"))
+PUZZLES_FILE = BASE / "puzzles.json"
+PUZZLES = json.loads(PUZZLES_FILE.read_text(encoding="utf-8")) if PUZZLES_FILE.is_file() else []
 BY_ID = {p["number"]: p for p in PUZZLES}
 PROGRESS_FILE = BASE / "progress.json"
 
@@ -198,6 +199,9 @@ def play_move(move, engine_path):
 
 
 def render_book_puzzle_mode(engine_path, board_component, piece_images, board_position_dict, legal_move_map):
+    if not PUZZLES:
+        st.error("Book puzzles are missing from the GitHub deployment. Commit book_puzzles/puzzles.json and all 100 PNG files beside app.py, then redeploy.")
+        st.stop()
     s = st.session_state
     if "book_puzzle_progress" not in s:
         s.book_puzzle_progress = read_progress()

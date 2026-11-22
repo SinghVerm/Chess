@@ -2,6 +2,7 @@ import base64
 import json
 import io
 import random
+import os
 import shutil
 from pathlib import Path
 
@@ -884,25 +885,27 @@ def move_history_text(history):
 
 
 def auto_find_stockfish():
+    """Find the correct executable for Windows desktop or Linux Streamlit Cloud."""
     base = Path(__file__).resolve().parent
+    if os.name != "nt":
+        # Debian's apt package usually installs Stockfish at /usr/games/stockfish,
+        # which is not always included in the Streamlit Cloud PATH.
+        for candidate in (
+            shutil.which("stockfish"),
+            "/usr/games/stockfish",
+            "/usr/bin/stockfish",
+            str(base / "stockfish"),
+        ):
+            if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return ""
 
-    patterns = [
-        "stockfish*.exe",
-        "stockfish/**/stockfish*.exe",
-        "stockfish*",
-        "stockfish/**/stockfish*",
-    ]
-
-    for pattern in patterns:
+    for pattern in ("stockfish*.exe", "stockfish/**/stockfish*.exe"):
         for item in base.glob(pattern):
             if item.is_file():
                 return str(item)
 
-    system_path = shutil.which("stockfish")
-    if system_path:
-        return system_path
-
-    return ""
+    return shutil.which("stockfish") or ""
 
 
 def stockfish_move(board, engine_path, rating):
@@ -1797,7 +1800,7 @@ detected_stockfish = auto_find_stockfish()
 engine_path = st.sidebar.text_input(
     "Stockfish executable",
     value=detected_stockfish,
-    placeholder=r"C:\ChessTrainer\stockfish\stockfish.exe",
+    placeholder=(r"C:\ChessTrainer\stockfish\stockfish.exe" if os.name == "nt" else "/usr/games/stockfish"),
 )
 
 if st.sidebar.button("New game", use_container_width=True):
@@ -1872,8 +1875,8 @@ with st.sidebar.expander("Import game / position"):
         st.rerun()
 
 st.sidebar.caption(
-    "Tip: put the Stockfish executable inside a folder named 'stockfish' "
-    "beside app.py and the app will try to find it automatically."
+    "On Streamlit Cloud, packages.txt installs Stockfish automatically. "
+    "On Windows, put your Stockfish .exe inside a folder named stockfish beside app.py."
 )
 
 # The book puzzle trainer is an independent mode: don't change the ongoing
